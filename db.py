@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey, UniqueConstraint, select, func, delete, and_, update
 )
 from sqlalchemy.engine import Engine, Connection
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
 # ---------------------------
@@ -87,18 +88,13 @@ def init_db(engine: Engine) -> None:
 
 
 # ---------------------------
-# Safe audit helper (only change)
+# Safe audit helper (never breaks writes)
 # ---------------------------
 def _audit(conn: Connection, op: str, target: str, meta: str = "") -> None:
-    """
-    Best-effort audit insert. Never fail the transaction.
-    Uses a dict so the 'object' column gets quoted properly.
-    """
     try:
         ins = sa.insert(audit_log).values({"op": op, "object": target, "meta": meta})
         conn.execute(ins)
     except Exception:
-        # Do not let audit failures break main operations
         pass
 
 
@@ -161,23 +157,48 @@ def people_from_labor_code(code: Optional[str]) -> int:
         return 0
 
 
+# ---------------------------
+# Atomic UPSERTs (fixes the error you saw)
+# ---------------------------
 def upsert_cell(conn: Connection, row_id: int, day: int,
                 task: Optional[str], hours: Optional[float], labor_code: Optional[str]) -> None:
-    existing = conn.execute(
-        select(day_cells.c.id).where(and_(day_cells.c.row_id == row_id, day_cells.c.day == day))
-    ).fetchone()
-    if existing:
-        conn.execute(
-            day_cells.update().where(day_cells.c.id == existing.id).values(
-                task=task, hours=hours, labor_code=labor_code
-            )
-        )
-        _audit(conn, "update", "day_cell", f"row={row_id}, day={day}")
-    else:
-        conn.execute(
-            day_cells.insert().values(row_id=row_id, day=day, task=task, hours=hours, labor_code=labor_code)
-        )
-        _audit(conn, "insert", "day_cell", f"row={row_id}, day={day}")
+    """
+    Atomic upsert using ON CONFLICT (row_id, day) DO UPDATE.
+    Eliminates unique-constraint races and aborted-transaction cascades.
+    """
+    stmt = pg_insert(day_cells).values(
+        row_id=row_id, day=day, task=task, hours=hours, labor_code=labor_code
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[day_cells.c.row_id, day_cells.c.day],
+        set_={
+            "task": stmt.excluded.task,
+            "hours": stmt.excluded.hours,
+            "labor_code": stmt.excluded.labor_code,
+        },
+    )
+    conn.execute(stmt)
+    _audit(conn, "upsert", "day_cell", f"row={row_id}, day={day}")
+
+
+def bulk_upsert_cells(conn: Connection, records: List[Dict[str, Any]]) -> None:
+    """
+    Fast bulk version for Save-to-DB from the grid.
+    Each record: {row_id, day, task, hours, labor_code}
+    """
+    if not records:
+        return
+    stmt = pg_insert(day_cells).values(records)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[day_cells.c.row_id, day_cells.c.day],
+        set_={
+            "task": stmt.excluded.task,
+            "hours": stmt.excluded.hours,
+            "labor_code": stmt.excluded.labor_code,
+        },
+    )
+    conn.execute(stmt)
+    _audit(conn, "bulk_upsert", "day_cell", f"n={len(records)}")
 
 
 def read_cell_preview(conn: Connection, row_id: int) -> str:
@@ -218,7 +239,6 @@ def get_day_bounds(conn: Connection, sheet_id: int) -> tuple[int, int]:
 _CANON_SECTIONS = {"Outside", "Ground Floor", "1st Floor", "Roof"}
 
 def _normalize_section(label: str) -> Optional[str]:
-    """Return canonical section if label matches one of the 4; else None (means not a section header)."""
     lab = (label or "").strip()
     if lab in _CANON_SECTIONS:
         return lab
@@ -228,13 +248,6 @@ def _normalize_section(label: str) -> Optional[str]:
 
 
 def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
-    """
-    Wide CSV:
-      Col0 = label (either a SECTION header or a row's subsection name)
-      Then repeating triplets: [Day N] [Time (hours)] [Labor (workers)]
-    Only section headers that match: Outside, Ground Floor, 1st Floor, Roof
-    change the current_section.
-    """
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
         raise ValueError("CSV has too few columns.")
@@ -242,7 +255,6 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
     first_col = df.columns[0]
     cols = list(df.columns)
 
-    # Triplets by adjacency
     triplets = []
     for i, c in enumerate(cols):
         if str(c).strip().lower().startswith("day "):
@@ -294,20 +306,15 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
 
     for _, r in df.iterrows():
         label = str(r[first_col]).strip() if pd.notna(r[first_col]) else None
-
-        # Detect if this line is a pure header (no day/time/labor values)
         is_header = not _row_has_any_triplet_values(r)
 
         if is_header:
-            # Only treat as SECTION if label is one of the 4 canonical names.
             canon = _normalize_section(label or "")
             if canon:
                 current_section = canon
-            # else: ignore stray headers like "Painting (1250)", "Waste Removal", etc.
             continue
 
         if current_section is None:
-            # If the sheet starts with data rows before a real section header, skip them.
             continue
 
         subsection = label or ""
@@ -325,10 +332,9 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
             raw_labor = r.get(lc, None) if lc else None
 
             task  = _as_text(raw_task)
-            hours = _coerce_float(raw_hours)    # never crash on text
+            hours = _coerce_float(raw_hours)
             labor = _as_text(raw_labor)
 
-            # If the "hours" cell actually contains a text tag, treat as task
             if task is None and hours is None:
                 hours_text = _as_text(raw_hours)
                 if hours_text is not None and any(ch.isalpha() for ch in hours_text):
@@ -346,7 +352,7 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
             })
 
     if cells_bulk:
-        conn.execute(day_cells.insert(), cells_bulk)
+        bulk_upsert_cells(conn, cells_bulk)
 
     return int(sheet_id)
 
