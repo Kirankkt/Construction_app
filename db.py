@@ -16,29 +16,25 @@ from sqlalchemy.engine import Engine, Connection
 # Secrets / engine
 # ---------------------------
 def get_pg_url_from_secrets() -> str:
-    # Primary: Streamlit secrets
     try:
         return st.secrets["pg"]["url"]
     except Exception:
         pass
-    # Fallback: env var
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError(
-            "Postgres URL not found. Set [pg].url in Streamlit Secrets "
-            "or DATABASE_URL env var."
+            "Postgres URL not found. Put it in Streamlit Secrets as [pg].url or in DATABASE_URL."
         )
     return url
 
 
 def get_engine() -> Engine:
     url = get_pg_url_from_secrets()
-    # Fail fast on unreachable DBs
     return create_engine(
         url,
         pool_pre_ping=True,
         pool_recycle=1800,
-        connect_args={"connect_timeout": 10},  # fast failure instead of hanging
+        connect_args={"connect_timeout": 10},
     )
 
 
@@ -204,13 +200,27 @@ def get_day_bounds(conn: Connection, sheet_id: int) -> tuple[int, int]:
 # ---------------------------
 # Import / Export
 # ---------------------------
+
+_CANON_SECTIONS = {"Outside", "Ground Floor", "1st Floor", "Roof"}
+
+def _normalize_section(label: str) -> Optional[str]:
+    """Return canonical section if label matches one of the 4; else None (means not a section header)."""
+    lab = (label or "").strip()
+    if lab in _CANON_SECTIONS:
+        return lab
+    # allow a common alias
+    if lab.lower() == "first floor":
+        return "1st Floor"
+    return None
+
+
 def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
     """
-    Wide CSV format:
-      Col0 = Section/Subsection label (headers have only this col filled)
-      Then repeated triplets by adjacency: [Day N] [Time (hours)] [Labor (workers)]
-      (pandas may suffix duplicate headers like 'Time (hours).1' – that's OK.)
-    No imputation; empty cells remain null.
+    Wide CSV:
+      Col0 = label (either a SECTION header or a row's subsection name)
+      Then repeating triplets: [Day N] [Time (hours)] [Labor (workers)]
+    We only change 'current_section' when label is one of:
+      Outside, Ground Floor, 1st Floor, Roof
     """
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
@@ -219,7 +229,7 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
     first_col = df.columns[0]
     cols = list(df.columns)
 
-    # Build (day_col, time_col, labor_col, day_number) triplets using adjacency
+    # Triplets by adjacency
     triplets = []
     for i, c in enumerate(cols):
         if str(c).strip().lower().startswith("day "):
@@ -235,7 +245,7 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
 
     sheet_id = get_or_create_sheet(conn, sheet_name)
 
-    # Idempotent re-import: clear existing rows/cells for this sheet
+    # Idempotent re-import for this sheet
     conn.execute(delete(day_cells).where(
         day_cells.c.row_id.in_(select(rows.c.id).where(rows.c.sheet_id == sheet_id))
     ))
@@ -245,15 +255,12 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
     row_order = 0
     cells_bulk = []
 
-    def _is_header(row) -> bool:
-        # Header rows have only first column text, and all day/time/labor cells empty
+    def _row_has_any_triplet_values(row) -> bool:
         for (dc, tc, lc, _) in triplets:
-            if any(
-                cc is not None and pd.notna(row.get(cc, None)) and str(row.get(cc, "")).strip() != ""
-                for cc in (dc, tc, lc)
-            ):
-                return False
-        return True
+            for cc in (dc, tc, lc):
+                if cc is not None and pd.notna(row.get(cc, None)) and str(row.get(cc, "")).strip() != "":
+                    return True
+        return False
 
     def _as_text(v) -> Optional[str]:
         if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -270,24 +277,29 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
         try:
             return float(s)
         except Exception:
-            return None  # never crash importer
+            return None
 
     for _, r in df.iterrows():
         label = str(r[first_col]).strip() if pd.notna(r[first_col]) else None
 
-        if _is_header(r):
-            if label:
-                current_section = label
+        # Detect if this line is a pure header (no day/time/labor values)
+        is_header = not _row_has_any_triplet_values(r)
+
+        if is_header:
+            # Only treat as SECTION if label is one of the 4 canonical names.
+            canon = _normalize_section(label or "")
+            if canon:
+                current_section = canon
+            # else: ignore stray headers like "Painting (1250)", "Waste Removal", etc.
             continue
 
         if current_section is None:
-            # orphan row before a header; skip
+            # If the sheet starts with data rows before a real section header, skip them.
             continue
 
         subsection = label or ""
         row_order += 1
 
-        # Insert the row and capture row_id
         row_id = conn.execute(
             rows.insert().values(
                 sheet_id=sheet_id, section=current_section, subsection=subsection, row_order=row_order
@@ -300,16 +312,15 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
             raw_labor = r.get(lc, None) if lc else None
 
             task  = _as_text(raw_task)
-            hours = _coerce_float(raw_hours)    # SAFE: non-numeric becomes None
+            hours = _coerce_float(raw_hours)    # never crash on text
             labor = _as_text(raw_labor)
 
-            # If the "hours" cell actually contains text (sheet shift), treat it as the task
+            # If the "hours" cell actually contains a text tag, treat as task
             if task is None and hours is None:
                 hours_text = _as_text(raw_hours)
                 if hours_text is not None and any(ch.isalpha() for ch in hours_text):
-                    task = hours_text  # store as task; hours stay None
+                    task = hours_text
 
-            # Skip if the whole triplet is empty
             if task is None and hours is None and labor is None:
                 continue
 
@@ -328,7 +339,6 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
 
 
 def export_wide_csv(conn: Connection, sheet_id: int, out_path: str) -> None:
-    # collect rows ordered
     rws = conn.execute(
         select(rows.c.id, rows.c.section, rows.c.subsection, rows.c.row_order)
         .where(rows.c.sheet_id == sheet_id)
@@ -345,11 +355,9 @@ def export_wide_csv(conn: Connection, sheet_id: int, out_path: str) -> None:
         .order_by(day_cells.c.row_id.asc(), day_cells.c.day.asc())
     ).fetchall()
 
-    # Determine day range
     days = sorted({dc.day for dc in dcs}) if dcs else []
     max_day = max(days) if days else 0
 
-    # Build dataframe: first column + triplets
     data = []
     for r in rws:
         label = r.subsection or ""
@@ -373,7 +381,6 @@ def export_wide_csv(conn: Connection, sheet_id: int, out_path: str) -> None:
 # Spreadsheet helpers
 # ---------------------------
 def delete_cell(conn: Connection, row_id: int, day: int) -> None:
-    """Remove a day_cell when all three values are cleared in the grid."""
     conn.execute(
         delete(day_cells).where(and_(day_cells.c.row_id == row_id, day_cells.c.day == day))
     )
@@ -383,10 +390,6 @@ def delete_cell(conn: Connection, row_id: int, day: int) -> None:
 
 def fetch_wide_block(conn: Connection, sheet_id: int, section: str,
                      subsection: str, start_day: int, end_day: int) -> pd.DataFrame:
-    """
-    Build a wide 'Excel-like' block for one subsection and a day window.
-    Columns: RowID, Subsection, [Day d], [Time d], [Labor d] for each d in window.
-    """
     rws = conn.execute(
         select(rows.c.id, rows.c.subsection, rows.c.row_order)
         .where(and_(rows.c.sheet_id == sheet_id,
