@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os, glob, re, time
+import pandas as pd
 import sqlalchemy as sa
 import streamlit as st
 
@@ -12,6 +13,8 @@ from db import (
 )
 
 st.set_page_config(page_title="Fast Construction Editor (DB-backed)", layout="wide")
+
+CANON_SECTIONS = ["Outside", "Ground Floor", "1st Floor", "Roof"]
 
 
 # ---------------------------
@@ -33,13 +36,11 @@ def _find_latest_csv(data_dir: str) -> str | None:
         m = re.search(r"day\s*(\d+)", os.path.basename(p), re.IGNORECASE)
         return int(m.group(1)) if m else -1
 
-    # Prefer highest DayN; else newest modified
     csvs.sort(key=lambda p: (_day_from_name(p), os.path.getmtime(p)), reverse=True)
     return csvs[0]
 
 
 def _ensure_one_sheet(engine) -> int | None:
-    """If DB has no usable data, auto-import newest CSV from ./data and return its id."""
     with engine.begin() as conn:
         _sheets = list_sheets(conn)
         total_rows = conn.execute(sa.select(sa.func.count()).select_from(rows)).scalar() or 0
@@ -64,7 +65,6 @@ def _ensure_one_sheet(engine) -> int | None:
             return None
 
 
-# If empty, do the one-time auto-import
 seed_sheet_id = _ensure_one_sheet(engine)
 
 
@@ -82,7 +82,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"DB connection failed: {e}")
 
-    # Debug counts (instant truth)
+    # quick counts
     with engine.begin() as conn:
         counts = conn.execute(
             sa.text("select "
@@ -106,7 +106,6 @@ with st.sidebar:
 
     st.subheader("Import/Export")
 
-    # Upload UI (optional; creates a NEW sheet)
     data_dir = os.path.join(os.path.dirname(__file__), "data")
     os.makedirs(data_dir, exist_ok=True)
     uploaded = st.file_uploader("Import wide CSV", type=["csv"], accept_multiple_files=False)
@@ -133,7 +132,6 @@ with st.sidebar:
             st.download_button("Download CSV", f, file_name=os.path.basename(out_path), mime="text/csv")
 
 
-# If no sheets (no seed + nothing uploaded), stop early
 if not _sheets:
     st.title("🧱 Fast Construction Editor (DB-backed)")
     st.info("No sheets yet. Upload a CSV in the sidebar, or add one in ./data and refresh.")
@@ -141,148 +139,142 @@ if not _sheets:
 
 
 # ---------------------------
-# Main UI: Quick editor + Spreadsheet
+# Main UI
 # ---------------------------
 st.title("🧱 Fast Construction Editor (DB-backed)")
-st.caption("Quick cell entry, labor×hours cost, row reordering, and an Excel-like grid. Data is persisted to PostgreSQL via Streamlit Secrets.")
+st.caption("Spreadsheet editing with multi-select filters; quick edits live **below** the grid. Data persists to PostgreSQL.")
 
+# ---- Filters (multi-select) ----
 with engine.begin() as conn:
-    sections = get_sections(conn, active_sheet_id)
+    all_sections = get_sections(conn, active_sheet_id)
 
-cA, cB = st.columns(2)
-section = cA.selectbox("Section", sections, index=0 if sections else None)
+# Show only canonical sections in the picker; if DB has others, we hide them.
+available_sections = [s for s in all_sections if s in CANON_SECTIONS] or all_sections
 
+sec_pick = st.multiselect("Sections", options=available_sections,
+                          default=available_sections, placeholder="Choose one or more sections")
+
+# Gather all subsections across the chosen sections
 with engine.begin() as conn:
-    subs = get_subsections(conn, active_sheet_id, section) if section else []
-subsection = cB.selectbox("Subsection", subs, index=0 if subs else None)
+    sub_by_sec = {s: get_subsections(conn, active_sheet_id, s) for s in sec_pick}
 
-tab_quick, tab_sheet = st.tabs(["Quick editor", "Spreadsheet view"])
+all_subs = sorted({sub for subs in sub_by_sec.values() for sub in subs})
+sub_pick = st.multiselect("Subsections", options=all_subs, default=all_subs,
+                          placeholder="Choose one or more subsections")
 
-# =======================
-# Quick Editor
-# =======================
-with tab_quick:
-    row_choices, row_ids = [], []
+# ---- Spreadsheet view ----
+st.subheader("Spreadsheet")
+with engine.begin() as conn:
+    min_day, max_day = get_day_bounds(conn, active_sheet_id)
+win = st.slider("Day range", min_value=min_day, max_value=max(max_day, min_day),
+                value=(min_day, min(min_day + 13, max_day)), step=1)
+
+# Build a combined dataframe for selected sections & subsections
+blocks: list[pd.DataFrame] = []
+with engine.begin() as conn:
+    for s in sec_pick:
+        for sub in sorted(set(sub_pick).intersection(set(sub_by_sec.get(s, [])))):
+            df_block = fetch_wide_block(conn, active_sheet_id, s, sub, win[0], win[1])
+            if not df_block.empty:
+                df_block.insert(0, "Section", s)  # show which section the row belongs to
+                blocks.append(df_block)
+
+if blocks:
+    grid_df = pd.concat(blocks, ignore_index=True)
+else:
+    grid_df = pd.DataFrame(columns=["Section", "RowID", "Subsection"] +
+                           sum(([f"Day {d}", f"Time {d}", f"Labor {d}"] for d in range(win[0], win[1]+1)), []))
+
+# Editable grid
+cfg = {"Section": st.column_config.TextColumn(disabled=True, width="small"),
+       "RowID":   st.column_config.NumberColumn(disabled=True, width="small"),
+       "Subsection": st.column_config.TextColumn(disabled=True, width="large")}
+for d in range(win[0], win[1] + 1):
+    cfg[f"Day {d}"]   = st.column_config.TextColumn(width="medium")
+    cfg[f"Time {d}"]  = st.column_config.NumberColumn(format="%.1f", width="small")
+    cfg[f"Labor {d}"] = st.column_config.TextColumn(width="small")
+
+edited = st.data_editor(
+    grid_df,
+    hide_index=True,
+    use_container_width=True,
+    num_rows="fixed",
+    column_config=cfg,
+    key="sheet_editor",
+)
+
+if st.button("Save changes to DB", type="primary"):
     with engine.begin() as conn:
-        if section and subsection:
-            rws = get_rows_for_subsection(conn, active_sheet_id, section, subsection)
+        for _, row in edited.iterrows():
+            rid = int(row["RowID"])
+            for d in range(win[0], win[1] + 1):
+                task  = row.get(f"Day {d}")
+                hours = row.get(f"Time {d}")
+                labor = row.get(f"Labor {d}")
+                # normalize
+                task  = (str(task).strip()  if task  not in (None, "", float("nan")) else None)
+                labor = (str(labor).strip() if labor not in (None, "", float("nan")) else None)
+                try:
+                    hours = float(hours) if hours not in (None, "", float("nan")) else None
+                except Exception:
+                    hours = None
+                if task is None and hours is None and labor is None:
+                    delete_cell(conn, rid, d)
+                else:
+                    upsert_cell(conn, rid, d, task, hours, labor)
+    st.success("Saved.")
+
+st.divider()
+
+# ---- Quick editor BELOW the sheet ----
+st.subheader("Quick edit (focused change)")
+
+# Build the row list across current filters
+row_choices, row_ids = [], []
+with engine.begin() as conn:
+    for s in sec_pick:
+        for sub in sorted(set(sub_pick).intersection(set(sub_by_sec.get(s, [])))):
+            rws = get_rows_for_subsection(conn, active_sheet_id, s, sub)
             for r in rws:
                 prev = read_cell_preview(conn, r["id"])
-                row_choices.append(f"Row#{r['row_order']} – {prev}")
+                row_choices.append(f"[{s}] {sub} • Row#{r['row_order']} – {prev}")
                 row_ids.append(r["id"])
-    row_label = st.selectbox("Row", row_choices, index=0 if row_choices else None)
-    row_id = row_ids[row_choices.index(row_label)] if row_choices else None
 
-    st.markdown("### Place a value")
-    c1, c2, c3 = st.columns(3)
-    day = c1.number_input("Day", min_value=1, value=1, step=1)
-    hours = c2.number_input("Time (hours)", min_value=0.0, value=0.0, step=0.5, format="%.1f")
-    group_id = c3.number_input("Group ID (e.g., 6 for '.06')", min_value=0, value=6, step=1)
+row_label = st.selectbox("Row", row_choices, index=0 if row_choices else None)
+row_id = row_ids[row_choices.index(row_label)] if row_choices else None
 
-    task = c1.text_input("Task name", value="")
-    people = c2.number_input("people (from labor code)", min_value=0, value=0, step=1)
-    labor_code = c3.text_input("Labor code", value=f"{people}.{group_id:02d}")
+c1, c2, c3 = st.columns(3)
+day = c1.number_input("Day", min_value=1, value=1, step=1)
+hours = c2.number_input("Time (hours)", min_value=0.0, value=0.0, step=0.5, format="%.1f")
+group_id = c3.number_input("Group ID (e.g., 6 for '.06')", min_value=0, value=6, step=1)
 
-    rate = st.number_input("Rate per person-hour", min_value=0.0, value=0.0, step=50.0)
-    ppl = people_from_labor_code(labor_code)
-    if rate or hours or labor_code:
-        lh = ppl * float(hours or 0)
-        st.caption(f"Labor-hours: **{lh:.1f}**  |  People: **{ppl}**  |  Cost @ rate: **{(lh*rate):,.2f}**")
+task = c1.text_input("Task name", value="")
+people = c2.number_input("people (from labor code)", min_value=0, value=0, step=1)
+labor_code = c3.text_input("Labor code", value=f"{people}.{group_id:02d}")
 
-    cL, cR = st.columns(2)
-    if cL.button("Apply to this Day", type="primary", disabled=row_id is None):
-        with engine.begin() as conn:
-            upsert_cell(conn, row_id, int(day),
+rate = st.number_input("Rate per person-hour", min_value=0.0, value=0.0, step=50.0)
+ppl = people_from_labor_code(labor_code)
+if rate or hours or labor_code:
+    lh = ppl * float(hours or 0)
+    st.caption(f"Labor-hours: **{lh:.1f}**  |  People: **{ppl}**  |  Cost @ rate: **{(lh*rate):,.2f}**")
+
+cL, cR = st.columns(2)
+if cL.button("Apply to this Day", type="primary", disabled=row_id is None):
+    with engine.begin() as conn:
+        upsert_cell(conn, row_id, int(day),
+                    task if task.strip() else None,
+                    float(hours) if hours > 0 else None,
+                    labor_code.strip() if labor_code.strip() else None)
+    st.success("Saved.")
+
+start_day = cR.number_input("Range start", min_value=1, value=1, step=1)
+end_day = cR.number_input("Range end", min_value=max(1, int(start_day)), value=int(start_day), step=1)
+if st.button("Apply to range", disabled=row_id is None):
+    a, b = sorted((int(start_day), int(end_day)))
+    with engine.begin() as conn:
+        for d in range(a, b + 1):
+            upsert_cell(conn, row_id, d,
                         task if task.strip() else None,
                         float(hours) if hours > 0 else None,
                         labor_code.strip() if labor_code.strip() else None)
-        st.success("Saved.")
-
-    start_day = cR.number_input("Range start", min_value=1, value=1, step=1)
-    end_day = cR.number_input("Range end", min_value=max(1, int(start_day)), value=int(start_day), step=1)
-    if st.button("Apply to range", disabled=row_id is None):
-        a, b = sorted((int(start_day), int(end_day)))
-        with engine.begin() as conn:
-            for d in range(a, b + 1):
-                upsert_cell(conn, row_id, d,
-                            task if task.strip() else None,
-                            float(hours) if hours > 0 else None,
-                            labor_code.strip() if labor_code.strip() else None)
-        st.success(f"Saved Days {a}–{b}.")
-
-    st.markdown("### Reorder rows (within this subsection)")
-    u, dwn, _ = st.columns(3)
-    with engine.begin() as conn:
-        rws = get_rows_for_subsection(conn, active_sheet_id, section, subsection) if (section and subsection) else []
-    if rws and row_id is not None:
-        ids = [r["id"] for r in rws]
-        idx = ids.index(row_id)
-        if u.button("Move ↑", disabled=(idx == 0)):
-            with engine.begin() as conn:
-                swap_row_order(conn, ids[idx - 1], ids[idx])
-            st.rerun()
-        if dwn.button("Move ↓", disabled=(idx == len(ids) - 1)):
-            with engine.begin() as conn:
-                swap_row_order(conn, ids[idx], ids[idx + 1])
-            st.rerun()
-
-
-# =======================
-# Spreadsheet View
-# =======================
-with tab_sheet:
-    st.subheader("Excel-like grid")
-
-    # day bounds for the sheet (fallback to 1..90)
-    with engine.begin() as conn:
-        min_day, max_day = get_day_bounds(conn, active_sheet_id)
-
-    win = st.slider("Day range", min_value=min_day, max_value=max(max_day, min_day),
-                    value=(min_day, min(min_day + 13, max_day)), step=1)
-
-    if section and subsection:
-        with engine.begin() as conn:
-            sheet_df = fetch_wide_block(conn, active_sheet_id, section, subsection, win[0], win[1])
-
-        if sheet_df.empty:
-            st.info("No rows for this subsection yet.")
-        else:
-            cfg = {}
-            for d in range(win[0], win[1] + 1):
-                cfg[f"Day {d}"]   = st.column_config.TextColumn(width="medium")
-                cfg[f"Time {d}"]  = st.column_config.NumberColumn(format="%.1f", width="small")
-                cfg[f"Labor {d}"] = st.column_config.TextColumn(width="small")
-
-            edited = st.data_editor(
-                sheet_df,
-                hide_index=True,
-                use_container_width=True,
-                num_rows="fixed",
-                disabled=("RowID", "Subsection"),
-                column_config=cfg,
-                key="sheet_editor",
-            )
-
-            if st.button("Save changes to DB", type="primary"):
-                with engine.begin() as conn:
-                    for _, row in edited.iterrows():
-                        rid = int(row["RowID"])
-                        for d in range(win[0], win[1] + 1):
-                            task  = row.get(f"Day {d}")
-                            hours = row.get(f"Time {d}")
-                            labor = row.get(f"Labor {d}")
-
-                            # normalize empties
-                            task  = (str(task).strip()  if task  not in (None, "", float("nan")) else None)
-                            labor = (str(labor).strip() if labor not in (None, "", float("nan")) else None)
-                            try:
-                                hours = float(hours) if hours not in (None, "", float("nan")) else None
-                            except Exception:
-                                hours = None
-
-                            if task is None and hours is None and labor is None:
-                                delete_cell(conn, rid, d)
-                            else:
-                                upsert_cell(conn, rid, d, task, hours, labor)
-
-                st.success("Saved. You can switch the day window and continue editing.")
+    st.success(f"Saved Days {a}–{b}.")
