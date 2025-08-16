@@ -36,7 +36,6 @@ def _find_latest_csv(data_dir: str) -> str | None:
 
 
 def _ensure_one_sheet(engine) -> int | None:
-    """If DB has no usable data, auto-import newest CSV from ./data and return its id."""
     with engine.begin() as conn:
         _sheets = list_sheets(conn)
         total_rows = conn.execute(sa.select(sa.func.count()).select_from(rows)).scalar() or 0
@@ -49,14 +48,17 @@ def _ensure_one_sheet(engine) -> int | None:
     if not candidate:
         return None
 
-    # Visible status so you know it's alive
     with st.status(f"Importing seed CSV **{os.path.basename(candidate)}** into Postgres…", expanded=True) as status:
-        st.write("Reading + normalizing…")
-        with engine.begin() as conn:
-            sheet_id = import_wide_csv(conn, candidate, sheet_name=os.path.basename(candidate))
-        st.write("Committed to DB.")
-        status.update(state="complete", label=f"Imported {os.path.basename(candidate)} → sheet #{sheet_id}")
-    return sheet_id
+        try:
+            with engine.begin() as conn:
+                sheet_id = import_wide_csv(conn, candidate, sheet_name=os.path.basename(candidate))
+            status.update(state="complete", label=f"Imported {os.path.basename(candidate)} → sheet #{sheet_id}")
+            return sheet_id
+        except Exception as e:
+            status.update(state="error", label="Import failed")
+            st.exception(e)
+            return None
+
 
 # If empty, do the one-time auto-import
 seed_sheet_id = _ensure_one_sheet(engine)
