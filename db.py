@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import streamlit as st
+import sqlalchemy as sa
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String, Float, Text, DateTime,
     ForeignKey, UniqueConstraint, select, func, delete, and_, update
@@ -86,6 +87,22 @@ def init_db(engine: Engine) -> None:
 
 
 # ---------------------------
+# Safe audit helper (only change)
+# ---------------------------
+def _audit(conn: Connection, op: str, target: str, meta: str = "") -> None:
+    """
+    Best-effort audit insert. Never fail the transaction.
+    Uses a dict so the 'object' column gets quoted properly.
+    """
+    try:
+        ins = sa.insert(audit_log).values({"op": op, "object": target, "meta": meta})
+        conn.execute(ins)
+    except Exception:
+        # Do not let audit failures break main operations
+        pass
+
+
+# ---------------------------
 # CRUD helpers / queries
 # ---------------------------
 def list_sheets(conn: Connection) -> List[Dict[str, Any]]:
@@ -132,8 +149,7 @@ def swap_row_order(conn: Connection, row_id_a: int, row_id_b: int) -> None:
         return
     conn.execute(update(rows).where(rows.c.id == row_id_a).values(row_order=b.row_order))
     conn.execute(update(rows).where(rows.c.id == row_id_b).values(row_order=a.row_order))
-    conn.execute(audit_log.insert().values(op="swap", object="row_order",
-                                           meta=f"{row_id_a}<->{row_id_b}"))
+    _audit(conn, "swap", "row_order", f"{row_id_a}<->{row_id_b}")
 
 
 def people_from_labor_code(code: Optional[str]) -> int:
@@ -156,14 +172,12 @@ def upsert_cell(conn: Connection, row_id: int, day: int,
                 task=task, hours=hours, labor_code=labor_code
             )
         )
-        conn.execute(audit_log.insert().values(op="update", object="day_cell",
-                                               meta=f"row={row_id}, day={day}"))
+        _audit(conn, "update", "day_cell", f"row={row_id}, day={day}")
     else:
         conn.execute(
             day_cells.insert().values(row_id=row_id, day=day, task=task, hours=hours, labor_code=labor_code)
         )
-        conn.execute(audit_log.insert().values(op="insert", object="day_cell",
-                                               meta=f"row={row_id}, day={day}"))
+        _audit(conn, "insert", "day_cell", f"row={row_id}, day={day}")
 
 
 def read_cell_preview(conn: Connection, row_id: int) -> str:
@@ -208,7 +222,6 @@ def _normalize_section(label: str) -> Optional[str]:
     lab = (label or "").strip()
     if lab in _CANON_SECTIONS:
         return lab
-    # allow a common alias
     if lab.lower() == "first floor":
         return "1st Floor"
     return None
@@ -219,8 +232,8 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
     Wide CSV:
       Col0 = label (either a SECTION header or a row's subsection name)
       Then repeating triplets: [Day N] [Time (hours)] [Labor (workers)]
-    We only change 'current_section' when label is one of:
-      Outside, Ground Floor, 1st Floor, Roof
+    Only section headers that match: Outside, Ground Floor, 1st Floor, Roof
+    change the current_section.
     """
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
@@ -384,8 +397,7 @@ def delete_cell(conn: Connection, row_id: int, day: int) -> None:
     conn.execute(
         delete(day_cells).where(and_(day_cells.c.row_id == row_id, day_cells.c.day == day))
     )
-    conn.execute(audit_log.insert().values(op="delete", object="day_cell",
-                                           meta=f"row={row_id}, day={day}"))
+    _audit(conn, "delete", "day_cell", f"row={row_id}, day={day}")
 
 
 def fetch_wide_block(conn: Connection, sheet_id: int, section: str,
