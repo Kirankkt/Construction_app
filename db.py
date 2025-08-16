@@ -223,7 +223,7 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
 
     sheet_id = get_or_create_sheet(conn, sheet_name)
 
-    # Clear existing data for idempotent re-import
+    # Idempotent re-import: clear existing rows/cells for this sheet
     conn.execute(delete(day_cells).where(
         day_cells.c.row_id.in_(select(rows.c.id).where(rows.c.sheet_id == sheet_id))
     ))
@@ -232,6 +232,88 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
     current_section: Optional[str] = None
     row_order = 0
     cells_bulk = []
+
+    def _is_header(row) -> bool:
+        # Header rows have only first column text, and all day/time/labor cells empty
+        for (dc, tc, lc, _) in triplets:
+            if any(
+                cc is not None and pd.notna(row.get(cc, None)) and str(row.get(cc, "")).strip() != ""
+                for cc in (dc, tc, lc)
+            ):
+                return False
+        return True
+
+    def _as_text(v) -> Optional[str]:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        s = str(v).strip()
+        return s if s != "" else None
+
+    def _coerce_float(v) -> Optional[float]:
+        if v is None:
+            return None
+        s = str(v).strip().replace(",", "")
+        if s == "":
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None  # never crash importer
+
+    for _, r in df.iterrows():
+        label = str(r[first_col]).strip() if pd.notna(r[first_col]) else None
+
+        if _is_header(r):
+            if label:
+                current_section = label
+            continue
+
+        if current_section is None:
+            # orphan row before a header; skip
+            continue
+
+        subsection = label or ""
+        row_order += 1
+
+        # Insert the row and capture row_id
+        row_id = conn.execute(
+            rows.insert().values(
+                sheet_id=sheet_id, section=current_section, subsection=subsection, row_order=row_order
+            ).returning(rows.c.id)
+        ).scalar()
+
+        for (dc, tc, lc, dnum) in triplets:
+            raw_task  = r.get(dc, None)
+            raw_hours = r.get(tc, None) if tc else None
+            raw_labor = r.get(lc, None) if lc else None
+
+            task  = _as_text(raw_task)
+            hours = _coerce_float(raw_hours)    # <-- SAFE: non-numeric becomes None
+            labor = _as_text(raw_labor)
+
+            # If the "hours" cell actually contains text (sheet shift), treat it as the task
+            if task is None and hours is None:
+                hours_text = _as_text(raw_hours)
+                if hours_text is not None and any(ch.isalpha() for ch in hours_text):
+                    task = hours_text  # store as task; hours stay None
+
+            # Skip if the whole triplet is empty
+            if task is None and hours is None and labor is None:
+                continue
+
+            cells_bulk.append({
+                "row_id": int(row_id),
+                "day": int(dnum),
+                "task": task,
+                "hours": hours,
+                "labor_code": labor,
+            })
+
+    if cells_bulk:
+        conn.execute(day_cells.insert(), cells_bulk)
+
+    return int(sheet_id)
+
 
     def _is_header(row) -> bool:
         for (dc, tc, lc, _) in triplets:
