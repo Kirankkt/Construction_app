@@ -3,13 +3,14 @@ from __future__ import annotations
 import os
 from typing import Optional, List, Dict, Any
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String, Float, Text, DateTime,
     ForeignKey, UniqueConstraint, select, func, delete, and_, update
 )
 from sqlalchemy.engine import Engine, Connection
+
 
 # ---------------------------
 # Secrets / engine
@@ -37,7 +38,7 @@ def get_engine() -> Engine:
         url,
         pool_pre_ping=True,
         pool_recycle=1800,
-        connect_args={"connect_timeout": 10},  # <- THIS MAKES HANGS FAIL FAST
+        connect_args={"connect_timeout": 10},  # fast failure instead of hanging
     )
 
 
@@ -89,7 +90,7 @@ def init_db(engine: Engine) -> None:
 
 
 # ---------------------------
-# CRUD helpers
+# CRUD helpers / queries
 # ---------------------------
 def list_sheets(conn: Connection) -> List[Dict[str, Any]]:
     res = conn.execute(select(sheets.c.id, sheets.c.name).order_by(sheets.c.created_at.asc()))
@@ -99,7 +100,7 @@ def list_sheets(conn: Connection) -> List[Dict[str, Any]]:
 def get_or_create_sheet(conn: Connection, name: str) -> int:
     row = conn.execute(select(sheets.c.id).where(sheets.c.name == name)).fetchone()
     if row:
-        return row.id
+        return int(row.id)
     rid = conn.execute(sheets.insert().values(name=name).returning(sheets.c.id)).scalar()
     return int(rid)
 
@@ -187,6 +188,17 @@ def read_cell_preview(conn: Connection, row_id: int) -> str:
     if r.labor_code:
         parts.append(f"{r.labor_code}")
     return f"D{r.day}: " + (", ".join(parts) if parts else "—")
+
+
+def get_day_bounds(conn: Connection, sheet_id: int) -> tuple[int, int]:
+    r = conn.execute(
+        select(func.min(day_cells.c.day), func.max(day_cells.c.day))
+        .select_from(day_cells.join(rows, rows.c.id == day_cells.c.row_id))
+        .where(rows.c.sheet_id == sheet_id)
+    ).fetchone()
+    if not r or r[0] is None or r[1] is None:
+        return (1, 90)
+    return (int(r[0]), int(r[1]))
 
 
 # ---------------------------
@@ -288,7 +300,7 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
             raw_labor = r.get(lc, None) if lc else None
 
             task  = _as_text(raw_task)
-            hours = _coerce_float(raw_hours)    # <-- SAFE: non-numeric becomes None
+            hours = _coerce_float(raw_hours)    # SAFE: non-numeric becomes None
             labor = _as_text(raw_labor)
 
             # If the "hours" cell actually contains text (sheet shift), treat it as the task
@@ -307,59 +319,6 @@ def import_wide_csv(conn: Connection, csv_path: str, sheet_name: str) -> int:
                 "task": task,
                 "hours": hours,
                 "labor_code": labor,
-            })
-
-    if cells_bulk:
-        conn.execute(day_cells.insert(), cells_bulk)
-
-    return int(sheet_id)
-
-
-    def _is_header(row) -> bool:
-        for (dc, tc, lc, _) in triplets:
-            if any(
-                cc is not None and pd.notna(row.get(cc, None)) and str(row.get(cc, "")).strip() != ""
-                for cc in (dc, tc, lc)
-            ):
-                return False
-        return True
-
-    for _, r in df.iterrows():
-        label = str(r[first_col]).strip() if pd.notna(r[first_col]) else None
-
-        if _is_header(r):
-            if label:
-                current_section = label
-            continue
-
-        if current_section is None:
-            # orphan row before a header; skip
-            continue
-
-        subsection = label or ""
-        row_order += 1
-
-        # Insert row and capture row_id (avoid executemany+RETURNING)
-        row_id = conn.execute(
-            rows.insert().values(
-                sheet_id=sheet_id, section=current_section, subsection=subsection, row_order=row_order
-            ).returning(rows.c.id)
-        ).scalar()
-
-        for (dc, tc, lc, dnum) in triplets:
-            task = r.get(dc, None)
-            hours = r.get(tc, None) if tc else None
-            labor = r.get(lc, None) if lc else None
-
-            if (pd.isna(task) or str(task).strip() == "") and pd.isna(hours) and (labor is None or str(labor).strip() == ""):
-                continue
-
-            cells_bulk.append({
-                "row_id": int(row_id),
-                "day": int(dnum),
-                "task": str(task).strip() if pd.notna(task) and str(task).strip() != "" else None,
-                "hours": float(hours) if hours is not None and pd.notna(hours) else None,
-                "labor_code": str(labor).strip() if labor is not None and str(labor).strip() != "" else None,
             })
 
     if cells_bulk:
@@ -408,3 +367,58 @@ def export_wide_csv(conn: Connection, sheet_id: int, out_path: str) -> None:
         cols.extend([f"Day {d}", "Time (hours)", "Labor (workers)"])
 
     pd.DataFrame(data)[cols].to_csv(out_path, index=False)
+
+
+# ---------------------------
+# Spreadsheet helpers
+# ---------------------------
+def delete_cell(conn: Connection, row_id: int, day: int) -> None:
+    """Remove a day_cell when all three values are cleared in the grid."""
+    conn.execute(
+        delete(day_cells).where(and_(day_cells.c.row_id == row_id, day_cells.c.day == day))
+    )
+    conn.execute(audit_log.insert().values(op="delete", object="day_cell",
+                                           meta=f"row={row_id}, day={day}"))
+
+
+def fetch_wide_block(conn: Connection, sheet_id: int, section: str,
+                     subsection: str, start_day: int, end_day: int) -> pd.DataFrame:
+    """
+    Build a wide 'Excel-like' block for one subsection and a day window.
+    Columns: RowID, Subsection, [Day d], [Time d], [Labor d] for each d in window.
+    """
+    rws = conn.execute(
+        select(rows.c.id, rows.c.subsection, rows.c.row_order)
+        .where(and_(rows.c.sheet_id == sheet_id,
+                    rows.c.section == section,
+                    rows.c.subsection == subsection))
+        .order_by(rows.c.row_order.asc())
+    ).fetchall()
+    if not rws:
+        return pd.DataFrame()
+
+    row_ids = [r.id for r in rws]
+    dcs = conn.execute(
+        select(day_cells.c.row_id, day_cells.c.day, day_cells.c.task,
+               day_cells.c.hours, day_cells.c.labor_code)
+        .where(and_(day_cells.c.row_id.in_(row_ids),
+                    day_cells.c.day >= start_day,
+                    day_cells.c.day <= end_day))
+        .order_by(day_cells.c.row_id.asc(), day_cells.c.day.asc())
+    ).fetchall()
+
+    by_rd = {(c.row_id, c.day): c for c in dcs}
+    data = []
+    for r in rws:
+        row_obj = {"RowID": int(r.id), "Subsection": r.subsection or ""}
+        for d in range(start_day, end_day + 1):
+            c = by_rd.get((r.id, d))
+            row_obj[f"Day {d}"]   = (c.task if c else None)
+            row_obj[f"Time {d}"]  = (float(c.hours) if c and c.hours is not None else None)
+            row_obj[f"Labor {d}"] = (c.labor_code if c else None)
+        data.append(row_obj)
+
+    cols = ["RowID", "Subsection"]
+    for d in range(start_day, end_day + 1):
+        cols.extend([f"Day {d}", f"Time {d}", f"Labor {d}"])
+    return pd.DataFrame(data, columns=cols)
